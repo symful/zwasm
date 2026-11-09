@@ -205,7 +205,9 @@ pub const WasiP2Ctx = struct {
     udp_sockets: std.ArrayList(p2sock.UdpSocket) = .empty,
     /// `wasi:http/types` `fields` resources (ADR-0205 phase D; both generations);
     /// a HTTP_FIELDS_RT handle's rep indexes this list. Dropped entries are
-    /// deinit'ed in place (slot stays; reps are never reused).
+    /// deinit'ed in place (slot stays). Reps are reused only after
+    /// `reclaimServiceRequest` (component_wasi_p3.zig) shrinks the http tables
+    /// past a request no live handle reaches.
     http_fields: std.ArrayList(p3http.HttpFields) = .empty,
     http_requests: std.ArrayList(p3http.HttpRequest) = .empty,
     http_responses: std.ArrayList(p3http.HttpResponse) = .empty,
@@ -1504,6 +1506,17 @@ pub fn p2StreamFutureCancel(caller: *Caller, handle: u32) WasiP2Error!u32 {
     return (async_mod.ReturnCode{ .cancelled = @intCast(n) }).encode();
 }
 
+/// The http host roles a stream or future end carries, scrubbed by both drop
+/// paths (the guest's, here, and the host's `drop_transferred_end`): the
+/// handle's at once, the shared's with its last end, whose body bytes are
+/// freed with it.
+pub fn scrubHttpRoles(ctx: *WasiP2Ctx, handle: u32, shared: u32) void {
+    _ = ctx.host_trailer_ok_futures.remove(handle);
+    if (shared != 0 and (ctx.shared.refcountOf(shared) orelse 0) == 1) {
+        if (ctx.host_body_bytes.fetchRemove(shared)) |kv| ctx.alloc.free(kv.value.data);
+    }
+}
+
 /// `canon stream.drop-{readable,writable}` / `future.drop-{readable,writable}`
 /// (ADR-0189 ζ2): mark the shared rendezvous dropped (so a blocked peer observes
 /// DROPPED — traps if a copy is mid-flight) then release the end + its shared ref
@@ -1551,6 +1564,7 @@ pub fn p2StreamFutureDrop(caller: *Caller, handle: u32) WasiP2Error!void {
         _ = ctx.host_result_futures.remove(handle);
         _ = ctx.pending_reads.remove(handle);
         _ = ctx.pending_writes.remove(handle);
+        scrubHttpRoles(ctx, handle, end.shared);
         if (end.shared != 0 and (ctx.shared.refcountOf(end.shared) orelse 0) == 1) {
             _ = ctx.host_sinks.remove(end.shared);
             _ = ctx.host_sources.remove(end.shared);

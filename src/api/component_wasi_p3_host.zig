@@ -1657,6 +1657,14 @@ fn http3FieldsClone(caller: *Caller, self: u32) WasiP2Error!u32 {
 
 // -- request / response / request-options (ADR-0205 phase D-2) --
 
+/// A future the host mints but never writes (`sent`, or a trailers future the
+/// host answers through `host_trailer_ok_futures`) keeps only the guest's
+/// end; holding the writable would keep both for the instance's life. The
+/// raw drop leaves the rendezvous un-DROPPED, so a read waits as before.
+fn releaseHostWritable(ctx: *WasiP2Ctx, writable: u32) WasiP2Error!void {
+    try async_mod.dropEnd(&ctx.streams, &ctx.shared, writable);
+}
+
 /// Release a stream/future end TRANSFERRED into a request/response at
 /// `new` time (the guest's own handle moved to the host): the peer must
 /// observe DROPPED or its writer task never completes.
@@ -1664,6 +1672,9 @@ pub fn http3DropTransferredEnd(ctx: *WasiP2Ctx, handle: u32) void {
     if (handle == 0) return;
     _ = ctx.host_result_futures.remove(handle);
     _ = ctx.pending_reads.remove(handle);
+    // A stale end has no shared; the drop below reports nothing for it either.
+    const shared = if (ctx.streams.get(handle)) |end| end.shared else |_| 0;
+    ctx_mod.scrubHttpRoles(ctx, handle, shared);
     // EXEMPT-FALLBACK: destructor — a stale/already-dropped end is benign (D-568)
     async_mod.dropEndGuarded(&ctx.streams, &ctx.shared, handle) catch {};
 }
@@ -1714,6 +1725,7 @@ fn http3RequestNew(caller: *Caller, headers: u32, contents_disc: u32, contents: 
     }) catch return WasiP2Error.OutOfMemory;
     const handle = try ctx.resources.new(WasiP2Ctx.HTTP_REQUEST_RT, idx);
     const fut = try async_mod.newFuturePair(&ctx.streams, &ctx.shared, null);
+    try releaseHostWritable(ctx, fut.writable);
     try mem.write(retptr, handle);
     try mem.write(retptr + 4, fut.readable);
 }
@@ -1917,6 +1929,7 @@ fn http3ResponseNew(caller: *Caller, headers: u32, contents_disc: u32, contents:
     }) catch return WasiP2Error.OutOfMemory;
     const handle = try ctx.resources.new(WasiP2Ctx.HTTP_RESPONSE_RT, idx);
     const fut = try async_mod.newFuturePair(&ctx.streams, &ctx.shared, null);
+    try releaseHostWritable(ctx, fut.writable);
     try mem.write(retptr, handle);
     try mem.write(retptr + 4, fut.readable);
 }
@@ -2028,6 +2041,7 @@ fn http3RequestConsumeBody(caller: *Caller, this: u32, res_fut: u32, retptr: u32
     };
     const trailers = if (req.trailers_future != 0) req.trailers_future else blk: {
         const fut = try async_mod.newFuturePair(&ctx.streams, &ctx.shared, null);
+        try releaseHostWritable(ctx, fut.writable);
         try ctx.host_trailer_ok_futures.put(ctx.alloc, fut.readable, {});
         break :blk fut.readable;
     };
@@ -2054,6 +2068,7 @@ fn http3ResponseConsumeBody(caller: *Caller, this: u32, res_fut: u32, retptr: u3
     };
     const trailers = if (resp.trailers_future != 0) resp.trailers_future else blk: {
         const fut = try async_mod.newFuturePair(&ctx.streams, &ctx.shared, null);
+        try releaseHostWritable(ctx, fut.writable);
         try ctx.host_trailer_ok_futures.put(ctx.alloc, fut.readable, {});
         break :blk fut.readable;
     };

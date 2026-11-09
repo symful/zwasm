@@ -264,6 +264,10 @@ pub fn serviceHandle(built: *wasi_p2.BuiltComponent, req: ServiceRequest) !Servi
         return error.UnknownMethod;
     };
 
+    const marks: TableMarks = .of(ctx);
+    var body_writable: ?u32 = null;
+    defer reclaimServiceRequest(ctx, marks, body_writable);
+
     const fields_idx: u32 = @intCast(ctx.http_fields.items.len);
     try ctx.http_fields.append(alloc, .{});
     for (req.headers) |h| try ctx.http_fields.items[fields_idx].appendPair(alloc, h.name, h.value);
@@ -273,6 +277,7 @@ pub fn serviceHandle(built: *wasi_p2.BuiltComponent, req: ServiceRequest) !Servi
     var contents: ?u32 = null;
     if (req.body.len > 0) {
         const pair = try async_mod.newStreamPair(&ctx.streams, &ctx.shared, null);
+        body_writable = pair.writable;
         const shared_id = (try ctx.streams.get(pair.readable)).shared;
         try ctx.host_body_bytes.put(alloc, shared_id, .{ .data = try alloc.dupe(u8, req.body) });
         contents = pair.readable;
@@ -324,6 +329,75 @@ pub fn serviceHandle(built: *wasi_p2.BuiltComponent, req: ServiceRequest) !Servi
         filled += 1;
     }
     return .{ .status = resp.status, .headers = headers, .body = try body.toOwnedSlice(alloc) };
+}
+
+/// The http table lengths before one `serviceHandle`: what it and the guest
+/// add during the drive lies past them.
+const TableMarks = struct {
+    fields: usize,
+    requests: usize,
+    responses: usize,
+    reqopts: usize,
+
+    fn of(ctx: *const wasi_p2.WasiP2Ctx) TableMarks {
+        return .{
+            .fields = ctx.http_fields.items.len,
+            .requests = ctx.http_requests.items.len,
+            .responses = ctx.http_responses.items.len,
+            .reqopts = ctx.http_reqopts.items.len,
+        };
+    }
+};
+
+/// Hand back what one request left in the ctx, so one instance serves any
+/// number of them: the host's own body end and the response it was given are
+/// dropped, and the http tables shrink to `marks` unless a live handle or a
+/// pending send still reaches past them (a guest may keep a handle; WIT keeps
+/// a request's headers valid after `consume-body`).
+fn reclaimServiceRequest(ctx: *wasi_p2.WasiP2Ctx, marks: TableMarks, body_writable: ?u32) void {
+    const Ctx = wasi_p2.WasiP2Ctx;
+    if (body_writable) |w| wasi_p2.http3DropTransferredEnd(ctx, w);
+    // The payload is a response only when the handler returned `ok`.
+    if (ctx.task_return == 0) if (ctx.task_return_payload) |resp_handle| dropHostResponse(ctx, resp_handle);
+    ctx.task_return_payload = null;
+
+    if (ctx.pending_client_sends.items.len != 0) return;
+    for (ctx.resources.slots.items) |slot| {
+        const h = slot orelse continue;
+        const reaches = switch (h.rt) {
+            Ctx.HTTP_FIELDS_RT, Ctx.HTTP_FIELDS_VIEW_RT => h.rep >= marks.fields,
+            Ctx.HTTP_REQUEST_RT => h.rep >= marks.requests,
+            Ctx.HTTP_RESPONSE_RT => h.rep >= marks.responses,
+            Ctx.HTTP_REQOPTS_RT, Ctx.HTTP_REQOPTS_VIEW_RT => h.rep >= marks.reqopts,
+            else => false,
+        };
+        if (reaches) return;
+    }
+    // The 0.2 client halves index the same request and response tables.
+    for (ctx.http2.out_bodies.items) |b| if (b.req_rep >= marks.requests) return;
+    for (ctx.http2.futures.items) |f| if (f.req_rep >= marks.requests) return;
+    for (ctx.http2.in_bodies.items) |b| if (b.resp_rep >= marks.responses) return;
+
+    for (ctx.http_fields.items[marks.fields..]) |*f| f.deinit(ctx.alloc);
+    ctx.http_fields.shrinkRetainingCapacity(marks.fields);
+    for (ctx.http_requests.items[marks.requests..]) |*r| r.deinit(ctx.alloc);
+    ctx.http_requests.shrinkRetainingCapacity(marks.requests);
+    ctx.http_responses.shrinkRetainingCapacity(marks.responses);
+    ctx.http_reqopts.shrinkRetainingCapacity(marks.reqopts);
+}
+
+/// The response `handle` delivered is the host's: drop it with the body and
+/// trailers ends it still holds. A lent one stays, and keeps the tables.
+fn dropHostResponse(ctx: *wasi_p2.WasiP2Ctx, handle: u32) void {
+    const Ctx = wasi_p2.WasiP2Ctx;
+    const rep = ctx.resources.rep(Ctx.HTTP_RESPONSE_RT, handle) catch return;
+    _ = ctx.resources.drop(Ctx.HTTP_RESPONSE_RT, handle) catch return;
+    if (rep >= ctx.http_responses.items.len) return;
+    const resp = &ctx.http_responses.items[rep];
+    if (resp.contents_stream) |cs| wasi_p2.http3DropTransferredEnd(ctx, cs);
+    wasi_p2.http3DropTransferredEnd(ctx, resp.trailers_future);
+    resp.contents_stream = null;
+    resp.trailers_future = 0;
 }
 
 /// The no-progress hook of `serviceHandle`: once the guest delivered its
@@ -1255,6 +1329,57 @@ fn runServiceRequest(built: *wasi_p2.BuiltComponent, rop: HttpReqOp) !void {
         }
     }
     if (rop.expect_body) |eb| try testing.expectEqualStrings(eb, resp.body);
+}
+
+fn liveSlots(slots: anytype) usize {
+    var n: usize = 0;
+    for (slots) |s| n += @intFromBool(s != null);
+    return n;
+}
+
+test "serviceHandle: one instance answers request after request without the ctx growing (#688)" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/wasip3_official/http-service-echo.wasm", alloc, .limited(8 << 20));
+    defer alloc.free(bytes);
+    var eng = try Engine.init(alloc, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(alloc);
+    defer host.deinit();
+    host.io = io;
+    var built = try wasi_p2.buildWasiP2Component(&eng, alloc, bytes, &host, .{});
+    defer built.deinit();
+    const ctx = built.ctx;
+
+    const reqs = [_]ServiceRequest{
+        .{ .method = "POST", .path_with_query = "/echo", .authority = "localhost", .body = "hello, echo" },
+        .{ .method = "GET", .path_with_query = "/reflect-header", .authority = "localhost", .headers = &.{.{ .name = "x-echo", .value = "ping" }} },
+        .{ .method = "GET", .path_with_query = "/whatever", .authority = "localhost" },
+    };
+    const State = struct { fields: usize, requests: usize, responses: usize, bodies: usize, handles: usize, ends: usize, shareds: usize };
+    const state = struct {
+        fn of(c: *wasi_p2.WasiP2Ctx) State {
+            return .{
+                .fields = c.http_fields.items.len,
+                .requests = c.http_requests.items.len,
+                .responses = c.http_responses.items.len,
+                .bodies = c.host_body_bytes.count(),
+                .handles = liveSlots(c.resources.slots.items),
+                .ends = liveSlots(c.streams.slots.items),
+                .shareds = liveSlots(c.shared.slots.items),
+            };
+        }
+    }.of;
+    const before = state(ctx);
+    for (0..3) |_| {
+        for (reqs) |r| {
+            var resp = try serviceHandle(&built, r);
+            defer resp.deinit(alloc);
+            try testing.expectEqual(before, state(ctx));
+        }
+    }
 }
 
 /// The corpus entry a `test "wasip3-official: <name>"` block covers, taken
