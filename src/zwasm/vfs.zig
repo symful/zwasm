@@ -13,6 +13,16 @@ const Allocator = std.mem.Allocator;
 
 pub const RuntimeValue = @import("../runtime/value.zig").Value;
 
+/// Host write-through callback. `path`/`data` are borrowed for the call.
+pub const WriteCallback = *const fn (
+    ctx: ?*anyopaque,
+    path: [*]const u8,
+    path_len: usize,
+    offset: u64,
+    data: [*]const u8,
+    data_len: usize,
+) callconv(.c) i32;
+
 pub const Errno = enum(u16) {
     success = 0,
     acces = 2,
@@ -103,6 +113,13 @@ pub const MemFs = struct {
     alloc: Allocator,
     mounts: std.ArrayList(Mount) = .empty,
     fds: std.ArrayList(Fd) = .empty,
+    write_cb: ?WriteCallback = null,
+    write_ctx: ?*anyopaque = null,
+
+    pub fn setWriteCallback(self: *MemFs, ctx: ?*anyopaque, cb: ?WriteCallback) void {
+        self.write_ctx = ctx;
+        self.write_cb = cb;
+    }
 
     pub fn init(alloc: Allocator) !MemFs {
         var fs: MemFs = .{ .alloc = alloc };
@@ -225,6 +242,44 @@ pub const MemFs = struct {
             .writable = writable,
         };
         try self.mounts.items[mi].files.append(self.alloc, f);
+    }
+
+    /// Parse the `exportRoot` format and replace all files under `root`.
+    pub fn importRoot(self: *MemFs, root: []const u8, buf: []const u8) !void {
+        const mi = self.mountFor(root) orelse return error.BadPath;
+        if (!self.mounts.items[mi].writable) return error.ReadOnly;
+        if (buf.len < 4) return error.BadFormat;
+        const count = std.mem.readInt(u32, buf[0..4], .little);
+        var off: usize = 4;
+        var i: usize = 0;
+        while (i < self.mounts.items[mi].files.items.len) {
+            const f = self.mounts.items[mi].files.items[i];
+            if (underRoot(f.path, root)) {
+                self.alloc.free(f.path);
+                self.alloc.free(f.data);
+                self.alloc.destroy(f);
+                _ = self.mounts.items[mi].files.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        i = 0;
+        while (i < count) : (i += 1) {
+            if (off + 4 > buf.len) return error.BadFormat;
+            const plen = std.mem.readInt(u32, buf[off..][0..4], .little);
+            off += 4;
+            if (off + plen > buf.len) return error.BadFormat;
+            const path = buf[off..][0..plen];
+            off += plen;
+            if (off + 8 > buf.len) return error.BadFormat;
+            const size = std.mem.readInt(u64, buf[off..][0..8], .little);
+            off += 8;
+            if (size > buf.len - off) return error.BadFormat;
+            const data = buf[off..][0..@intCast(size)];
+            off += @intCast(size);
+            if (!underRoot(path, root)) return error.BadFormat;
+            try self.addFile(path, data, true);
+        }
     }
 
     fn underRoot(path: []const u8, root: []const u8) bool {
@@ -405,6 +460,17 @@ pub const MemFs = struct {
                 }
                 @memcpy(f.data[@intCast(slot.offset)..@intCast(end)], bytes);
                 slot.offset = end;
+                if (self.write_cb) |cb| {
+                    const rc = cb(
+                        self.write_ctx,
+                        f.path.ptr,
+                        f.path.len,
+                        slot.offset - l,
+                        bytes.ptr,
+                        bytes.len,
+                    );
+                    if (rc != 0) return e(.io);
+                }
             }
             total += l;
         }

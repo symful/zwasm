@@ -987,6 +987,37 @@ export fn zw_instance_export_mount(
     return @intCast(fs.exportRoot(root[0..root_len], empty[0..0]));
 }
 
+/// Replace all files under an in-memory VFS mount from the export format.
+export fn zw_instance_import_mount(
+    inst_ptr: ?*anyopaque,
+    root: [*]const u8,
+    root_len: usize,
+    buf: [*]const u8,
+    len: usize,
+) callconv(.c) i32 {
+    clearError();
+    const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return ZW_ERR_INVALID_ARG));
+    const fs = h.vfs orelse {
+        setError(ZW_ERR_INVALID_ARG, "instance has no VFS", .{});
+        return ZW_ERR_INVALID_ARG;
+    };
+    fs.importRoot(root[0..root_len], buf[0..len]) catch |e| {
+        setErrorName(ZW_ERR_INVALID_ARG, e);
+        return ZW_ERR_INVALID_ARG;
+    };
+    return ZW_OK;
+}
+
+/// Install a write-through callback for VFS file writes. Pass null to clear.
+export fn zw_instance_set_vfs_write_callback(
+    inst_ptr: ?*anyopaque,
+    ctx: ?*anyopaque,
+    cb: ?zwasm.vfs.WriteCallback,
+) callconv(.c) void {
+    const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return));
+    if (h.vfs) |fs| fs.setWriteCallback(ctx, cb);
+}
+
 export fn zw_instance_global_set(inst_ptr: ?*anyopaque, name: [*]const u8, name_len: usize, bits: u64) callconv(.c) i32 {
     clearError();
     const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return arityError("null instance")));
