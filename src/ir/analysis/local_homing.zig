@@ -87,13 +87,18 @@ pub const n_home_gpr: u32 = switch (builtin.target.cpu.arch) {
 /// temporaries: arm64 → 6, x86_64 → 4.
 pub const max_homed: u32 = @min(max_homed_global, n_home_gpr, n_allocatable_gpr -| temp_reserve);
 
+/// Array storage never has a zero length (Zig cannot index an empty array,
+/// and shared liveness code reads `local_idx[r]` under a runtime `count > 0`
+/// guard). wasm builds home nothing, so the slot is simply unused there.
+const homed_storage: u32 = @max(max_homed, 1);
+
 /// A resolved homing plan for one function. `count` pseudo-vregs are homed; the
 /// homed local's absolute wasm local index is `local_idx[r]` for rank
 /// `r in 0..count`. `rank_of[local_idx]` (via `rankOf`) is the inverse map.
 pub const Plan = struct {
     count: u32 = 0,
     /// rank → absolute wasm local index. Only `[0..count)` is meaningful.
-    local_idx: [max_homed]u32 = undefined,
+    local_idx: [homed_storage]u32 = undefined,
     /// Absolute wasm local index → rank, or null when that local is NOT homed.
     /// Sized to the function's total local count at plan time; backed by
     /// `rank_buf`.

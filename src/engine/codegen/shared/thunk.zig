@@ -32,7 +32,13 @@ const zir = @import("../../../ir/zir.zig");
 const arch_thunk = switch (builtin.target.cpu.arch) {
     .aarch64 => @import("../arm64/thunk.zig"),
     .x86_64 => @import("../x86_64/thunk.zig"),
-    else => @compileError("ADR-0066 bridge thunk encoder not implemented for this architecture"),
+    // wasm64 hosts run the interpreter only; no bridge thunk is emitted.
+    else => struct {
+        pub const thunk_bytes: usize = 1;
+        pub fn emitThunk(buf: []u8, callee_rt: usize, callee_entry: usize, sig: zir.FuncType) void {
+            _ = .{ buf, callee_rt, callee_entry, sig };
+        }
+    },
 };
 
 /// Bridge thunk byte count for the current target architecture.

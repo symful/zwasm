@@ -32,12 +32,13 @@ const code_map = @import("code_map.zig");
 const emit = switch (builtin_arch.target.cpu.arch) {
     .aarch64 => @import("../arm64/emit.zig"),
     .x86_64 => @import("../x86_64/emit.zig"),
-    else => @compileError("unsupported host arch for linker"),
+    // wasm64 hosts run the interpreter; the linker is never reached.
+    else => @import("emit_stub.zig"),
 };
 const inst = switch (builtin_arch.target.cpu.arch) {
     .aarch64 => @import("../arm64/inst.zig"),
     .x86_64 => @import("../x86_64/inst.zig"),
-    else => @compileError("unsupported host arch for linker"),
+    else => struct {},
 };
 
 pub const Error = error{
@@ -359,7 +360,7 @@ pub fn link(allocator: Allocator, func_bodies: []const FuncBody, num_imports: u3
                     }
                     inst.patchRel32(block.bytes, @intCast(fixup_abs), 5, @intCast(disp_bytes));
                 },
-                else => @compileError("unsupported host arch for linker patch loop"),
+                else => {},
             }
         }
     }

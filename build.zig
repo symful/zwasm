@@ -150,6 +150,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     applySanitize(core, sanitize_opts);
+    // The plugin links core into a shared library on Android, so its
+    // thread-local state must use PIC relocations.
+    core.pic = true;
     core.addImport("build_options", build_options_mod);
     // §9.3 / 3.1: `include/` carries the vendored C API headers
     // (wasm.h pinned via ADR-0004). Adding the path here lets
@@ -1502,6 +1505,99 @@ pub fn build(b: *std.Build) void {
     run_c_host.expectExitCode(0);
     const test_c_api_step = b.step("test-c-api", "Build libzwasm.a + the C host example, run the example");
     test_c_api_step.dependOn(&run_c_host.step);
+
+    // `zig build wasm-lib` — browser-flavored module for the Flutter plugin.
+    // zwasm's pointers are 64-bit on every supported host, so the browser
+    // target is wasm64-wasi (32-bit wasm can't satisfy its usize arithmetic).
+    // Interpreter only: the JIT has no wasm host backend.
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm64,
+        .os_tag = .wasi,
+    });
+    const wasm_options = b.addOptions();
+    wasm_options.addOption(WasmLevel, "wasm_level", .v3_0);
+    wasm_options.addOption(WasiLevel, "wasi_level", .p1);
+    wasm_options.addOption(EngineMode, "engine_mode", .interp);
+    wasm_options.addOption(bool, "trace_ringbuffer", false);
+    wasm_options.addOption(bool, "trace_stackprobe", false);
+    wasm_options.addOption(bool, "enable_component", false);
+    wasm_options.addOption(bool, "enable_wasi_p3", false);
+    wasm_options.addOption([]const u8, "version", zon.version);
+    const wasm_core = b.createModule(.{
+        .root_source_file = b.path("src/zwasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    wasm_core.addImport("build_options", wasm_options.createModule());
+    wasm_core.addIncludePath(b.path("include"));
+    wasm_core.addImport("zwasm", wasm_core);
+    const wasm_lib = b.addLibrary(.{
+        .name = "zwasm",
+        .linkage = .dynamic,
+        .root_module = wasm_core,
+    });
+    const wasm_lib_step = b.step("wasm-lib", "Build the wasm64-wasi zwasm module for the browser backend");
+    wasm_lib_step.dependOn(&b.addInstallArtifact(wasm_lib, .{}).step);
+
+    // `zig build plugin-lib` — the Flutter FFI shim + zwasm in one archive.
+    // A dedicated PIC, single-threaded core: Android's Bionic has no
+    // `__tls_get_addr` for the general-dynamic model Zig emits for TLS.
+    const plugin_core = b.createModule(.{
+        .root_source_file = b.path("src/zwasm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+        .single_threaded = true,
+    });
+    plugin_core.addImport("build_options", build_options_mod);
+    plugin_core.addIncludePath(b.path("include"));
+    plugin_core.addImport("zwasm", plugin_core);
+    const shim_mod = b.createModule(.{
+        .root_source_file = b.path("src/zwasm_plugin_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+        .single_threaded = true,
+    });
+    shim_mod.addImport("zwasm", plugin_core);
+    const shim_lib = b.addLibrary(.{
+        .name = "zwasm_plugin",
+        .linkage = .static,
+        .root_module = shim_mod,
+    });
+    shim_lib.bundle_compiler_rt = true;
+    const plugin_lib_step = b.step("plugin-lib", "Build libzwasm_plugin.a (zwasm + Flutter FFI shim) for Android/Windows");
+    plugin_lib_step.dependOn(&b.addInstallArtifact(shim_lib, .{}).step);
+
+    // `zig build plugin-wasm` — the browser module (no entry point, all
+    // exported shim symbols visible). No libc: wasm64-wasi has none.
+    const wasm_core_nolibc = b.createModule(.{
+        .root_source_file = b.path("src/zwasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+        .link_libc = false,
+    });
+    wasm_core_nolibc.addImport("build_options", wasm_options.createModule());
+    wasm_core_nolibc.addIncludePath(b.path("include"));
+    wasm_core_nolibc.addImport("zwasm", wasm_core_nolibc);
+    const wasm_shim_mod = b.createModule(.{
+        .root_source_file = b.path("src/zwasm_plugin_shim.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+        .link_libc = false,
+    });
+    wasm_shim_mod.addImport("zwasm", wasm_core_nolibc);
+    const wasm_exe = b.addExecutable(.{
+        .name = "zwasm_plugin",
+        .root_module = wasm_shim_mod,
+    });
+    wasm_exe.entry = .disabled;
+    wasm_exe.rdynamic = true;
+    const plugin_wasm_step = b.step("plugin-wasm", "Build zwasm_plugin.wasm (browser backend, wasm64-wasi reactor)");
+    plugin_wasm_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
 
     // `zig build static-lib` — install libzwasm.a + the public C headers into
     // zig-out/ for non-Zig consumers (Rust/C). External (non-zig) linkers must

@@ -14,6 +14,7 @@
 //! Zone 3 (`src/api/`); re-exported via `api/wasm.zig`.
 
 const std = @import("std");
+const plat = @import("../platform/alloc.zig");
 const testing = std.testing;
 
 const handles = @import("handles.zig");
@@ -371,7 +372,7 @@ pub export fn wasm_extern_vec_copy(out: ?*vec.ExternVec, src: ?*const vec.Extern
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(?*handles.Extern, s.size) catch {
+    const buf = plat.allocator.alloc(?*handles.Extern, s.size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };

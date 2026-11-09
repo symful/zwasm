@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const plat = @import("../platform/alloc.zig");
 const runtime = @import("../runtime/runtime.zig");
 const wasi_host = @import("../wasi/host.zig");
 const wasi_fd = @import("../wasi/fd.zig");
@@ -36,11 +37,11 @@ const testing = std.testing;
 ///
 /// Allocator: pinned to the engine's allocator path is not
 /// possible since this function does not take an Engine. Uses
-/// `std.heap.c_allocator` so the resulting Host is freeable
+/// `plat.allocator` so the resulting Host is freeable
 /// either through `_delete` here or through `wasm_store_delete`
 /// once installed.
 pub export fn zwasm_wasi_config_new() callconv(.c) ?*wasi_host.Host {
-    const alloc = std.heap.c_allocator;
+    const alloc = plat.allocator;
     const h = alloc.create(wasi_host.Host) catch return null;
     h.* = wasi_host.Host.init(alloc) catch {
         alloc.destroy(h);
@@ -56,7 +57,7 @@ pub export fn zwasm_wasi_config_new() callconv(.c) ?*wasi_host.Host {
 pub export fn zwasm_wasi_config_delete(h: ?*wasi_host.Host) callconv(.c) void {
     const handle = h orelse return;
     handle.deinit();
-    std.heap.c_allocator.destroy(handle);
+    plat.allocator.destroy(handle);
 }
 
 /// `zwasm_wasi_config_set_args(cfg, argc, argv)` — explicit argv
@@ -71,7 +72,7 @@ pub export fn zwasm_wasi_config_set_args(
 ) callconv(.c) void {
     const handle = h orelse return;
     if (argv == null) return;
-    const ca = std.heap.c_allocator;
+    const ca = plat.allocator;
     const tmp = ca.alloc([]const u8, argc) catch return;
     defer ca.free(tmp);
     for (0..argc) |i| tmp[i] = std.mem.span(argv[i]);
@@ -91,7 +92,7 @@ pub export fn zwasm_wasi_config_set_envs(
 ) callconv(.c) void {
     const handle = h orelse return;
     if (keys == null or vals == null) return;
-    const ca = std.heap.c_allocator;
+    const ca = plat.allocator;
     const k = ca.alloc([]const u8, count) catch return;
     defer ca.free(k);
     const v = ca.alloc([]const u8, count) catch return;
@@ -136,11 +137,15 @@ pub export fn zwasm_wasi_config_preopen_dir(
 /// `std.c.getenv` in `wasm_engine_new`).
 pub export fn zwasm_wasi_config_inherit_env(h: ?*wasi_host.Host) callconv(.c) bool {
     const handle = h orelse return false;
-    const ca = std.heap.c_allocator;
+    return if (comptime plat.is_wasm) false else inheritEnvImpl(handle);
+}
+
+fn inheritEnvImpl(handle: *wasi_host.Host) bool {
+    const ca = plat.allocator;
     const env: std.process.Environ = if (builtin.os.tag == .windows)
         .{ .block = .global }
     else posix_blk: {
-        const raw = std.c.environ;
+        const raw = plat.environ();
         var n: usize = 0;
         while (raw[n] != null) : (n += 1) {}
         break :posix_blk .{ .block = .{ .slice = raw[0..n :null] } };

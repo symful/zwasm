@@ -255,14 +255,18 @@ pub const jit_cohort_clobbers: if (builtin.target.cpu.arch == .aarch64 or builti
 /// `.{rt} ++ args` correctly and still preserves callee-saved registers.
 fn jitTrampoline(comptime R: type, f: anytype, rt: *JitRuntime, args: anytype) R {
     const r = @call(.auto, f, .{rt} ++ args);
-    asm volatile ("" ::: jit_cohort_clobbers);
+    if (comptime builtin.target.cpu.arch == .aarch64 or builtin.target.cpu.arch == .x86_64) {
+        asm volatile ("" ::: jit_cohort_clobbers);
+    }
     return r;
 }
 
 /// Void sibling of `jitTrampoline` for the arg'd void path.
 fn jitTrampolineVoid(f: anytype, rt: *JitRuntime, args: anytype) void {
     @call(.auto, f, .{rt} ++ args);
-    asm volatile ("" ::: jit_cohort_clobbers);
+    if (comptime builtin.target.cpu.arch == .aarch64 or builtin.target.cpu.arch == .x86_64) {
+        asm volatile ("" ::: jit_cohort_clobbers);
+    }
 }
 
 pub const JitRuntime = jit_abi.JitRuntime;

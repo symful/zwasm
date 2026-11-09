@@ -43,14 +43,16 @@ const dbg = @import("../../../support/dbg.zig");
 const emit = switch (builtin.target.cpu.arch) {
     .aarch64 => @import("../arm64/emit.zig"),
     .x86_64 => @import("../x86_64/emit.zig"),
-    else => @compileError("unsupported host arch — JIT requires aarch64 or x86_64"),
+    // wasm64 hosts build the interpreter only; the JIT pipeline is never
+    // reached, so the module needs the surface but no implementation.
+    else => @import("emit_stub.zig"),
 };
 
 /// ADR-0077 — per-arch op-internal scratch reservation lookup.
 const scratch_reservations: ?regalloc.ScratchReservationFn = switch (builtin.target.cpu.arch) {
     .aarch64 => &@import("../arm64/abi.zig").opScratchReservation,
     .x86_64 => &@import("../x86_64/abi.zig").opScratchReservation,
-    else => @compileError("unsupported host arch"),
+    else => null,
 };
 
 pub const Error = lowerer.Error || liveness.Error || regalloc.Error || emit.Error || hoist.Error || coalesce.Error || Allocator.Error;
@@ -257,7 +259,7 @@ pub fn compileOne(
             .gpr = @import("../arm64/abi.zig").allocatable_gprs.len,
             .fp = @import("../arm64/abi.zig").allocatable_v_regs.len,
         },
-        else => @compileError("unsupported host arch"),
+        else => .{ .gpr = 0, .fp = 0 },
     };
     var alloc = try regalloc.computeWith(allocator, &func, @max(pools.gpr, pools.fp), scratch_reservations, pools);
     errdefer regalloc.deinit(allocator, alloc);

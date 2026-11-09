@@ -291,7 +291,19 @@ fn translateTagIdx(from: *const jit_abi.JitRuntime, to: *const jit_abi.JitRuntim
 ///   - 1 (handler): install `eh_handler_sp` → SP, `eh_handler_fp`
 ///     → X29/RBP, then BR/JMP to `eh_handler_pc` (the absolute
 ///     landing-pad address; never returns to the wrapper).
-pub fn zwasmThrowTrampoline() callconv(.naked) noreturn {
+fn zwasmThrowTrampolineStub() callconv(.naked) noreturn {
+    @trap();
+}
+
+/// wasm builds the interpreter only, so the naked assembly trampoline is not
+/// referenced there; the stub keeps the declaration's shape for `jit_abi`.
+pub const zwasmThrowTrampoline = if (builtin.target.cpu.arch == .aarch64 or
+    builtin.target.cpu.arch == .x86_64)
+    zwasmThrowTrampolineNaked
+else
+    zwasmThrowTrampolineStub;
+
+fn zwasmThrowTrampolineNaked() callconv(.naked) noreturn {
     switch (builtin.target.cpu.arch) {
         // ARM64 body. The offsets into JitRuntime are inlined at
         // comptime via `std.fmt.comptimePrint` so the asm template
@@ -499,7 +511,9 @@ pub fn zwasmThrowTrampoline() callconv(.naked) noreturn {
                 : x86_64_clobbers),
             else => @compileError("unsupported x86_64 OS for EH trampoline"),
         },
-        else => @compileError("unsupported host arch for EH trampoline"),
+        // wasm builds the interpreter only; JIT throw sites never exist, so
+        // this stub is unreachable and need not carry assembly.
+        else => unreachable,
     }
 }
 

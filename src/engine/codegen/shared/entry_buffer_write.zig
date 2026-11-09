@@ -99,7 +99,9 @@ pub fn invokeBufferWrite(
 /// preserve the JIT-clobbered callee-saved cohort across the call.
 fn jitTrampolineBuf(f: BufferWriteFn, rt: *JitRuntime, results: [*]u64, args: [*]const u64) ErrCode {
     const code = f(rt, results, args);
-    asm volatile ("" ::: entry.jit_cohort_clobbers);
+    if (comptime builtin.target.cpu.arch == .aarch64 or builtin.target.cpu.arch == .x86_64) {
+        asm volatile ("" ::: entry.jit_cohort_clobbers);
+    }
     return code;
 }
 

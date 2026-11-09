@@ -14,7 +14,7 @@
 //! one-way keeps the cycle out of the carve-out (see ADR-0007 +
 //! handover note for chunk d). It moves with `instance.zig`.
 //!
-//! All vec data is allocated from `std.heap.c_allocator` so a vec
+//! All vec data is allocated from `plat.allocator` so a vec
 //! can be freed through the matching `_delete` regardless of
 //! which Engine produced it — C hosts may construct vecs without
 //! holding an Engine handle (e.g. before `wasm_engine_new`).
@@ -25,6 +25,7 @@
 //! pointer-only (no struct-layout cycle).
 
 const std = @import("std");
+const plat = @import("../platform/alloc.zig");
 const wasm_c_api = @import("wasm.zig");
 
 const testing = std.testing;
@@ -75,7 +76,7 @@ fn vecNewUninitialized(comptime T: type, comptime VecT: type, out: ?*VecT, size:
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(T, size) catch {
+    const buf = plat.allocator.alloc(T, size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };
@@ -88,7 +89,7 @@ fn vecNew(comptime T: type, comptime VecT: type, out: ?*VecT, size: usize, src: 
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(T, size) catch {
+    const buf = plat.allocator.alloc(T, size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };
@@ -107,7 +108,7 @@ fn vecCopy(comptime T: type, comptime VecT: type, out: ?*VecT, src: ?*const VecT
 
 fn vecDelete(comptime VecT: type, v: ?*VecT) void {
     const handle = v orelse return;
-    if (handle.data) |p| std.heap.c_allocator.free(p[0..handle.size]);
+    if (handle.data) |p| plat.allocator.free(p[0..handle.size]);
     handle.* = .{ .size = 0, .data = null };
 }
 
@@ -132,7 +133,7 @@ pub export fn wasm_byte_vec_copy(out: ?*ByteVec, src: ?*const ByteVec) callconv(
 }
 
 /// `wasm_byte_vec_delete(*ByteVec)` — free the data backing of a
-/// ByteVec. Pinned to `std.heap.c_allocator` (see header above).
+/// ByteVec. Pinned to `plat.allocator` (see header above).
 pub export fn wasm_byte_vec_delete(v: ?*ByteVec) callconv(.c) void {
     vecDelete(ByteVec, v);
 }
@@ -230,7 +231,7 @@ pub export fn wasm_extern_vec_new_uninitialized(out: ?*ExternVec, size: usize) c
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(?*wasm_c_api.Extern, size) catch {
+    const buf = plat.allocator.alloc(?*wasm_c_api.Extern, size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };
@@ -244,7 +245,7 @@ pub export fn wasm_extern_vec_new(out: ?*ExternVec, size: usize, src: ?[*]const 
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(?*wasm_c_api.Extern, size) catch {
+    const buf = plat.allocator.alloc(?*wasm_c_api.Extern, size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };

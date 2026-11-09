@@ -25,6 +25,8 @@
 
 const std = @import("std");
 
+const plat = @import("../platform/alloc.zig");
+
 const runtime = @import("../runtime/runtime.zig");
 const runtime_instance = @import("../runtime/instance/instance.zig");
 const runtime_instance_import = @import("../runtime/instance/import.zig");
@@ -87,7 +89,7 @@ const testing = std.testing;
 /// `wasm_engine_t` — process-wide top-level handle. Carries the
 /// allocator the binding will thread into runtimes (and into
 /// future `wasm_store_t` GC roots). The §9.3 / 3.3 binding uses
-/// `std.heap.c_allocator` so C hosts get malloc-equivalent
+/// `plat.allocator` so C hosts get malloc-equivalent
 /// lifetime; a future `zwasm.h` extension will let the host
 /// inject its own.
 pub const Engine = runtime.Engine;
@@ -231,12 +233,12 @@ pub export fn wasm_engine_new() callconv(.c) ?*Engine {
         var dbg_initialised: bool = false;
     };
     if (!tls.dbg_initialised) {
-        const raw = std.c.getenv("ZWASM_DEBUG");
+        const raw = plat.getenv("ZWASM_DEBUG");
         const value: ?[]const u8 = if (raw) |p| std.mem.span(p) else null;
         dbg.initFromEnv(value);
         tls.dbg_initialised = true;
     }
-    const alloc = std.heap.c_allocator;
+    const alloc = plat.allocator;
     const e = alloc.create(Engine) catch return null;
     // ADR-0184: the engine owns a `std.Io.Threaded` so the C-ABI
     // surface (which cannot receive a Zig io token) can serve WASI
@@ -382,9 +384,9 @@ pub export fn wasm_store_delete(s: ?*Store) callconv(.c) void {
     for (handle.retired_wasi_hosts.items) |host_opaque| {
         const host: *wasi_host.Host = @ptrCast(@alignCast(host_opaque));
         host.deinit();
-        std.heap.c_allocator.destroy(host);
+        plat.allocator.destroy(host);
     }
-    handle.retired_wasi_hosts.deinit(std.heap.c_allocator);
+    handle.retired_wasi_hosts.deinit(plat.allocator);
     alloc.destroy(handle);
 }
 
@@ -489,11 +491,11 @@ pub export fn zwasm_store_set_wasi(s: ?*Store, h: ?*wasi_host.Host) callconv(.c)
             // (ADR-0224). Kept fallible rather than assuming the capacity so a
             // violated reservation degrades instead of panicking in a library.
             // EXEMPT-FALLBACK: ADR-0014 — an append OOM accepts the leak over the UAF, mirroring parkInstance.
-            store.retired_wasi_hosts.append(std.heap.c_allocator, old_opaque) catch {};
+            store.retired_wasi_hosts.append(plat.allocator, old_opaque) catch {};
         } else {
             const old: *wasi_host.Host = @ptrCast(@alignCast(old_opaque));
             old.deinit();
-            std.heap.c_allocator.destroy(old);
+            plat.allocator.destroy(old);
         }
     }
     store.wasi_host_captured = false;
@@ -839,7 +841,7 @@ fn buildBindings(
             // instances stay callable and their exits report nothing.
             // Reserving at capture puts the allocation failure on the
             // instantiation, which can and does report it.
-            try store.retired_wasi_hosts.ensureUnusedCapacity(std.heap.c_allocator, 1);
+            try store.retired_wasi_hosts.ensureUnusedCapacity(plat.allocator, 1);
             store.wasi_host_captured = true;
             bindings[idx] = .{ .func = .{
                 .host_call = .{ .fn_ptr = thunk, .ctx = wasi_host_ptr },
@@ -1476,7 +1478,7 @@ fn instantiateJit(store: *Store, module: *const Module, builder_state: anytype, 
     // `runStart`, which can still fail the instantiation) — see buildBindings,
     // including why the retirement slot is reserved at capture.
     if (store.wasi_host != null) {
-        store.retired_wasi_hosts.ensureUnusedCapacity(std.heap.c_allocator, 1) catch {
+        store.retired_wasi_hosts.ensureUnusedCapacity(plat.allocator, 1) catch {
             unregisterJitEh(jit);
             jit.deinit(alloc);
             alloc.destroy(jit);
@@ -2128,7 +2130,7 @@ fn hostFuncThunk(rt: *runtime.Runtime, ctx: *anyopaque) anyerror!void {
     const np: u32 = @intCast(p.params.len);
     const nr = p.results.len;
     if (rt.operand_len < np) return runtime.Trap.StackOverflow;
-    const ca = std.heap.c_allocator;
+    const ca = plat.allocator;
     const bufs = try allocHostMarshalBuffers(ca, p.params.len, nr);
     const args_data = bufs.args;
     defer ca.free(args_data);
@@ -2682,7 +2684,7 @@ pub export fn wasm_extern_vec_delete(v: ?*ExternVec) callconv(.c) void {
         for (dp[0..handle.size]) |opt_ext| {
             if (opt_ext) |ext| wasm_extern_delete(ext);
         }
-        std.heap.c_allocator.free(dp[0..handle.size]);
+        plat.allocator.free(dp[0..handle.size]);
     }
     handle.* = .{ .size = 0, .data = null };
 }
@@ -2709,7 +2711,7 @@ pub export fn wasm_instance_exports(i: ?*const Instance, out: ?*ExternVec) callc
     }
     if (want == 0) return;
 
-    const buf = std.heap.c_allocator.alloc(?*Extern, want) catch return;
+    const buf = plat.allocator.alloc(?*Extern, want) catch return;
     @memset(buf, null);
     var populated: usize = 0;
 
@@ -2798,7 +2800,7 @@ pub export fn wasm_instance_exports(i: ?*const Instance, out: ?*ExternVec) callc
         for (buf[0..populated]) |opt_ext| {
             if (opt_ext) |ext| wasm_extern_delete(ext);
         }
-        std.heap.c_allocator.free(buf);
+        plat.allocator.free(buf);
         return;
     }
 
@@ -5326,8 +5328,8 @@ fn testingAllocEngine() !*Engine {
 
 fn deleteTestingAllocEngine(e: *Engine) void {
     // `wasm_engine_new` made the engine and its `Io.Threaded` with c_allocator.
-    e.alloc_ptr = std.heap.c_allocator.ptr;
-    e.alloc_vtable = @ptrCast(std.heap.c_allocator.vtable);
+    e.alloc_ptr = plat.allocator.ptr;
+    e.alloc_vtable = @ptrCast(plat.allocator.vtable);
     wasm_engine_delete(e);
 }
 

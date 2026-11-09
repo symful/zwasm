@@ -12,6 +12,12 @@
 //! Zone 2 — may import Zone 0 + 1 + sibling `src/runtime/runtime.zig`.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// wasm targets reject function alignment entirely; the 64-byte layout
+/// nudge is a native-host micro-optimization (#541) and is dropped there.
+const run_frame_align: u29 = if (builtin.target.cpu.arch == .wasm32 or
+    builtin.target.cpu.arch == .wasm64) 1 else 64;
 
 pub const zir = @import("../ir/zir.zig");
 const dispatch_table = @import("../ir/dispatch_table.zig");
@@ -52,12 +58,12 @@ pub fn step(
 /// against a 64-byte boundary (#541, Zen 3). `noinline` keeps a change
 /// to `run` from moving it; `align(64)` keeps a change to code laid
 /// out before it from moving it.
-noinline fn runFrame(
+noinline fn runFrameBody(
     rt: *Runtime,
     table: *const DispatchTable,
     f: *runtime.Frame,
     instrs: []const ZirInstr,
-) align(64) anyerror!void {
+) anyerror!void {
     while (f.pc < instrs.len and !f.done) {
         // ADR-0179 #3a: throttled cooperative-interrupt poll so a tight
         // `(loop (br 0))` with no calls is still interruptible. Zero cost
@@ -78,6 +84,29 @@ noinline fn runFrame(
         if (f.pc == cur) f.pc += 1;
     }
 }
+
+/// #541 — keep the hot loop on a 64-byte boundary on native hosts. wasm
+/// rejects function alignment outright, so it gets a plain wrapper.
+noinline fn runFrameAligned(
+    rt: *Runtime,
+    table: *const DispatchTable,
+    f: *runtime.Frame,
+    instrs: []const ZirInstr,
+) align(64) anyerror!void {
+    return runFrameBody(rt, table, f, instrs);
+}
+
+noinline fn runFramePlain(
+    rt: *Runtime,
+    table: *const DispatchTable,
+    f: *runtime.Frame,
+    instrs: []const ZirInstr,
+) anyerror!void {
+    return runFrameBody(rt, table, f, instrs);
+}
+
+const runFrame = if (builtin.target.cpu.arch == .wasm32 or
+    builtin.target.cpu.arch == .wasm64) runFramePlain else runFrameAligned;
 
 /// Walk an instruction sequence linearly. The loop tracks `pc`
 /// on the **current frame** (`rt.currentFrame().pc`) so control-

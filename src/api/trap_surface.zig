@@ -18,6 +18,7 @@
 //! Zone 3 — same as the rest of `src/api/`.
 
 const std = @import("std");
+const plat = @import("../platform/alloc.zig");
 const wasm_c_api = @import("wasm.zig");
 const handles = @import("handles.zig"); // for `Ref` (wasm_trap_as_ref view); pointer-only cycle
 const hooks = @import("../runtime/hooks.zig");
@@ -387,12 +388,12 @@ pub const FrameVec = extern struct {
 };
 
 pub export fn wasm_frame_delete(f: ?*Frame) callconv(.c) void {
-    if (f) |p| std.heap.c_allocator.destroy(p);
+    if (f) |p| plat.allocator.destroy(p);
 }
 
 pub export fn wasm_frame_copy(f: ?*const Frame) callconv(.c) ?*Frame {
     const src = f orelse return null;
-    const nf = std.heap.c_allocator.create(Frame) catch return null;
+    const nf = plat.allocator.create(Frame) catch return null;
     nf.* = src.*;
     return nf;
 }
@@ -419,7 +420,7 @@ pub export fn wasm_frame_vec_new_uninitialized(out: ?*FrameVec, size: usize) cal
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(?*Frame, size) catch {
+    const buf = plat.allocator.alloc(?*Frame, size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };
@@ -432,7 +433,7 @@ pub export fn wasm_frame_vec_new(out: ?*FrameVec, size: usize, src: ?[*]const ?*
         o.* = .{ .size = 0, .data = null };
         return;
     }
-    const buf = std.heap.c_allocator.alloc(?*Frame, size) catch {
+    const buf = plat.allocator.alloc(?*Frame, size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };
@@ -450,7 +451,7 @@ pub export fn wasm_frame_vec_copy(out: ?*FrameVec, src: ?*const FrameVec) callco
         return;
     }
     // Deep copy — each vec owns its own frames (shallow would double-free).
-    const buf = std.heap.c_allocator.alloc(?*Frame, s.size) catch {
+    const buf = plat.allocator.alloc(?*Frame, s.size) catch {
         o.* = .{ .size = 0, .data = null };
         return;
     };
@@ -465,13 +466,13 @@ pub export fn wasm_frame_vec_delete(v: ?*FrameVec) callconv(.c) void {
         for (dp[0..handle.size]) |opt| {
             if (opt) |fr| wasm_frame_delete(fr);
         }
-        std.heap.c_allocator.free(dp[0..handle.size]);
+        plat.allocator.free(dp[0..handle.size]);
     }
     handle.* = .{ .size = 0, .data = null };
 }
 
 fn newFrame(f: trap_trace.Frame) ?*Frame {
-    const nf = std.heap.c_allocator.create(Frame) catch return null;
+    const nf = plat.allocator.create(Frame) catch return null;
     nf.* = .{ .func_index = f.func_idx, .func_offset = f.func_offset, .module_offset = f.module_offset };
     return nf;
 }
@@ -491,11 +492,11 @@ pub export fn wasm_trap_trace(t: ?*const Trap, out: ?*FrameVec) callconv(.c) voi
     o.* = .{ .size = 0, .data = null };
     const handle = t orelse return;
     const frames = handle.trace_ptr orelse return;
-    const buf = std.heap.c_allocator.alloc(?*Frame, handle.trace_len) catch return;
+    const buf = plat.allocator.alloc(?*Frame, handle.trace_len) catch return;
     for (frames[0..handle.trace_len], buf, 0..) |f, *slot, i| {
         slot.* = newFrame(f) orelse {
             for (buf[0..i]) |made| wasm_frame_delete(made);
-            std.heap.c_allocator.free(buf);
+            plat.allocator.free(buf);
             return;
         };
     }

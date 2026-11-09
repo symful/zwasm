@@ -3,7 +3,7 @@
 //! The `wasm_{valtype,functype,globaltype,tabletype,memorytype}_t` opaque
 //! type descriptors + their queries + `wasm_valtype_vec_t`. These are pure
 //! data descriptors (no Store/runtime coupling), so they allocate directly
-//! via `std.heap.c_allocator` — unlike Trap/Module/Instance which recover
+//! via `plat.allocator` — unlike Trap/Module/Instance which recover
 //! the allocator from a Store back-pointer (`api/instance.zig`).
 //!
 //! Ownership (upstream wasm-c-api, ADR-0004 pin): every `_new` returns an
@@ -19,9 +19,10 @@
 //! auto-link into the C-API lib.
 
 const std = @import("std");
+const plat = @import("../platform/alloc.zig");
 const testing = std.testing;
 
-const ca = std.heap.c_allocator;
+const ca = plat.allocator;
 
 // wasm.h: WASM_I32=0, I64=1, F32=2, F64=3, EXTERNREF=128, FUNCREF=129.
 // wasm_mutability_t: WASM_CONST=0, WASM_VAR=1.

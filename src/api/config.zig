@@ -12,6 +12,7 @@
 //! `wasm_engine_new`).
 
 const std = @import("std");
+const plat = @import("../platform/alloc.zig");
 
 const instance = @import("instance.zig");
 const Engine = instance.Engine;
@@ -23,14 +24,14 @@ pub const Config = struct {
 };
 
 pub export fn wasm_config_new() callconv(.c) ?*Config {
-    const c = std.heap.c_allocator.create(Config) catch return null;
+    const c = plat.allocator.create(Config) catch return null;
     c.* = .{};
     return c;
 }
 
 pub export fn wasm_config_delete(c: ?*Config) callconv(.c) void {
     const handle = c orelse return;
-    std.heap.c_allocator.destroy(handle);
+    plat.allocator.destroy(handle);
 }
 
 /// `wasm_engine_new_with_config(own wasm_config_t*)` — consumes (takes
@@ -38,7 +39,7 @@ pub export fn wasm_config_delete(c: ?*Config) callconv(.c) void {
 /// honours no config knobs, so this is `wasm_engine_new` after adopting the
 /// config per the `own` transfer contract. Null config is tolerated.
 pub export fn wasm_engine_new_with_config(c: ?*Config) callconv(.c) ?*Engine {
-    if (c) |handle| std.heap.c_allocator.destroy(handle);
+    if (c) |handle| plat.allocator.destroy(handle);
     return instance.wasm_engine_new();
 }
 

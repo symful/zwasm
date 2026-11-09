@@ -32,6 +32,7 @@
 //! treats it as Zone 1.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Single source of truth = build.zig.zon `.version`, threaded through
 // build_options by build.zig (no hand-sync; bump the zon when the user cuts
@@ -59,6 +60,7 @@ pub const Memory = @import("zwasm/memory.zig").Memory;
 pub const Global = @import("zwasm/global.zig").Global;
 pub const Table = @import("zwasm/table.zig").Table;
 pub const Linker = @import("zwasm/linker.zig").Linker;
+pub const WasiConfig = @import("zwasm/linker.zig").WasiConfig;
 pub const Caller = @import("zwasm/caller.zig").Caller;
 
 /// Zig-idiomatic tagged-union mirror of `wasm_val_t`.
@@ -99,21 +101,25 @@ pub const Value = union(enum) {
 // pre-ADR-0023 `c_api_lib.zig` mechanism.
 // ============================================================
 comptime {
-    _ = @import("api/wasm.zig");
-    _ = @import("api/wasi.zig");
-    _ = @import("api/trap_surface.zig");
-    _ = @import("api/engine_verdict_test.zig");
-    _ = @import("api/vec.zig");
-    _ = @import("api/types.zig");
-    _ = @import("api/instance.zig");
-    _ = @import("api/zwasm_ext.zig");
-    _ = @import("api/module_introspect.zig");
-    _ = @import("api/extern_new.zig");
-    _ = @import("api/ref_base.zig");
-    _ = @import("api/config.zig");
-    _ = @import("api/host_info.zig");
-    _ = @import("api/module_serialize.zig");
-    _ = @import("api/cross_module.zig");
+    // The C ABI binding is native-only: it pulls `std.heap.c_allocator`, and
+    // wasm64 has no libc. Browser builds use the Zig facade through the shim.
+    if (builtin.target.cpu.arch != .wasm32 and builtin.target.cpu.arch != .wasm64) {
+        _ = @import("api/wasm.zig");
+        _ = @import("api/wasi.zig");
+        _ = @import("api/trap_surface.zig");
+        _ = @import("api/engine_verdict_test.zig");
+        _ = @import("api/vec.zig");
+        _ = @import("api/types.zig");
+        _ = @import("api/instance.zig");
+        _ = @import("api/zwasm_ext.zig");
+        _ = @import("api/module_introspect.zig");
+        _ = @import("api/extern_new.zig");
+        _ = @import("api/ref_base.zig");
+        _ = @import("api/config.zig");
+        _ = @import("api/host_info.zig");
+        _ = @import("api/module_serialize.zig");
+        _ = @import("api/cross_module.zig");
+    }
 }
 
 // ============================================================

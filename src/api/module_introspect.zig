@@ -8,6 +8,7 @@
 //! Zone 3 (`src/api/`). Re-exported via `api/wasm.zig`.
 
 const std = @import("std");
+const plat = @import("../platform/alloc.zig");
 const testing = std.testing;
 
 const parser = @import("../parse/parser.zig");
@@ -18,7 +19,7 @@ const vec = @import("vec.zig");
 const instance = @import("instance.zig");
 
 const Module = instance.Module;
-const ca = std.heap.c_allocator;
+const ca = plat.allocator;
 
 /// Map an internal `zir.ValType` → a `wasm_valkind_t` byte (wasm.h:
 /// I32=0..F64=3, EXTERNREF=128, FUNCREF=129). v128 has no base-enum
