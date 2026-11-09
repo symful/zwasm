@@ -9,7 +9,20 @@
 //! instantiation. No host path is preopened and no std.Io is involved.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+
+const is_wasm = builtin.target.cpu.arch.isWasm();
+
+/// Web-only write-through hook; the JS bridge dispatches to Dart.
+extern "env" fn zwJsVfsWrite(
+    ctx: ?*anyopaque,
+    path: [*]const u8,
+    path_len: usize,
+    offset: u64,
+    data: [*]const u8,
+    data_len: usize,
+) callconv(.c) i32;
 
 pub const RuntimeValue = @import("../runtime/value.zig").Value;
 
@@ -461,14 +474,24 @@ pub const MemFs = struct {
                 @memcpy(f.data[@intCast(slot.offset)..@intCast(end)], bytes);
                 slot.offset = end;
                 if (self.write_cb) |cb| {
-                    const rc = cb(
-                        self.write_ctx,
-                        f.path.ptr,
-                        f.path.len,
-                        slot.offset - l,
-                        bytes.ptr,
-                        bytes.len,
-                    );
+                    const rc = if (comptime is_wasm)
+                        zwJsVfsWrite(
+                            self.write_ctx,
+                            f.path.ptr,
+                            f.path.len,
+                            slot.offset - l,
+                            bytes.ptr,
+                            bytes.len,
+                        )
+                    else
+                        cb(
+                            self.write_ctx,
+                            f.path.ptr,
+                            f.path.len,
+                            slot.offset - l,
+                            bytes.ptr,
+                            bytes.len,
+                        );
                     if (rc != 0) return e(.io);
                 }
             }

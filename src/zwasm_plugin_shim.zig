@@ -166,7 +166,7 @@ const ModuleH = struct {
 /// recovers it from `Caller.host_data`; the import's Dart/JS callback is
 /// invoked with `user_ctx` + the import index.
 const HostCtx = struct {
-    cb: ZWHostCallback,
+    cb: ?ZWHostCallback,
     user_ctx: ?*anyopaque,
     index: u32,
     module_name: []u8,
@@ -174,6 +174,16 @@ const HostCtx = struct {
     params: []zwasm.ir.zir.ValType,
     results: []zwasm.ir.zir.ValType,
 };
+
+/// Web-only bridge from the plugin wasm module to the JS host dispatch.
+extern "env" fn zwJsHostCall(
+    ctx: ?*anyopaque,
+    import_index: u32,
+    args: [*]const u64,
+    n_args: u32,
+    results: [*]u64,
+    n_results: u32,
+) callconv(.c) i32;
 
 const InstanceH = struct {
     instance: zwasm.Instance,
@@ -240,18 +250,37 @@ fn hostThunk(caller: *zwasm.Caller, args: []const zwasm.RuntimeValue, results: [
     if (args.len > 64 or results.len > 64) return error.HostTrap;
     var arg_bits: [64]u64 = undefined;
     var res_bits: [64]u64 = undefined;
-    for (args, 0..) |v, i| arg_bits[i] = v.bits64;
+    for (args, 0..) |v, i| {
+        arg_bits[i] = switch (hc.params[i]) {
+            .i32, .f32 => v.bits64 & 0xFFFF_FFFF,
+            else => v.bits64,
+        };
+    }
     for (results) |*v| v.* = .{ .bits64 = 0 };
-    const rc = hc.cb(
-        hc.user_ctx,
-        hc.index,
-        &arg_bits,
-        @intCast(args.len),
-        &res_bits,
-        @intCast(results.len),
-    );
+    const rc = if (comptime is_wasm)
+        zwJsHostCall(
+            hc.user_ctx,
+            hc.index,
+            &arg_bits,
+            @intCast(args.len),
+            &res_bits,
+            @intCast(results.len),
+        )
+    else
+        (hc.cb orelse return error.HostTrap)(
+            hc.user_ctx,
+            hc.index,
+            &arg_bits,
+            @intCast(args.len),
+            &res_bits,
+            @intCast(results.len),
+        );
     if (rc != 0) {
-        setError(ZW_ERR_TRAP, "host import {d} returned error {d}", .{ hc.index, rc });
+        setError(
+            ZW_ERR_TRAP,
+            "host import {s}.{s} (#{d}) returned error {d}",
+            .{ hc.module_name, hc.import_name, hc.index, rc },
+        );
         return error.HostTrap;
     }
     for (results, 0..) |*v, i| v.* = .{ .bits64 = res_bits[i] };
@@ -664,12 +693,8 @@ export fn zw_instance_new_with_imports(
 
     const has_imports = n_imports > 0;
     const has_wasi = wasi_ptr != null;
-    if (has_imports and host_cb == null) {
+    if (has_imports and host_cb == null and !is_wasm) {
         setError(ZW_ERR_INVALID_ARG, "host callback is required for imports", .{});
-        return null;
-    }
-    if (has_imports and is_wasm) {
-        setError(ZW_ERR_INVALID_ARG, "host imports are not supported on web yet", .{});
         return null;
     }
 
@@ -769,7 +794,7 @@ export fn zw_instance_new_with_imports(
     if (has_imports) {
         const lk = linker.?;
         const descs = imports.?;
-        const cb = host_cb.?;
+        const cb = host_cb;
         for (0..n_imports) |i| {
             const d = descs[i];
             const params = gpa.alloc(zwasm.ir.zir.ValType, d.params_len) catch return outOfMemoryNull();
