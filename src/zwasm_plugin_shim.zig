@@ -967,6 +967,28 @@ export fn zw_instance_memory_grow(inst_ptr: ?*anyopaque, delta: u32) callconv(.c
     return old;
 }
 
+/// Copies host bytes into guest memory at `addr`.
+export fn zw_instance_memory_write(
+    inst_ptr: ?*anyopaque,
+    addr: u64,
+    buf: [*]const u8,
+    len: usize,
+) callconv(.c) i32 {
+    clearError();
+    const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return arityError("null instance")));
+    const mem = h.instance.memory() orelse {
+        setError(ZW_ERR_INVALID_ARG, "instance has no memory", .{});
+        return ZW_ERR_INVALID_ARG;
+    };
+    const data = mem.slice();
+    if (addr > data.len or len > data.len - @as(usize, @intCast(addr))) {
+        setError(ZW_ERR_INVALID_ARG, "memory write out of bounds", .{});
+        return ZW_ERR_INVALID_ARG;
+    }
+    @memcpy(data[@intCast(addr)..][0..len], buf[0..len]);
+    return ZW_OK;
+}
+
 // ── globals ────────────────────────────────────────────────────────────────
 
 export fn zw_instance_global_info(inst_ptr: ?*anyopaque, name: [*]const u8, name_len: usize, out_kind: *u8, out_mutable: *u8) callconv(.c) i32 {
