@@ -154,22 +154,190 @@ const EngineH = struct {
 const ModuleH = struct {
     module: zwasm.Module,
     engine: *EngineH,
+    /// The parser's section bodies borrow the compile input, so the module
+    /// must keep a copy alive for its whole lifetime.
+    bytes: []u8,
     exports: ?zwasm.ModuleExports = null,
+    imports: ?zwasm.ModuleImports = null,
     refs: u32 = 1,
+};
+
+/// Host-side context handed to a `Linker.defineFuncRaw` thunk. The thunk
+/// recovers it from `Caller.host_data`; the import's Dart/JS callback is
+/// invoked with `user_ctx` + the import index.
+const HostCtx = struct {
+    cb: ZWHostCallback,
+    user_ctx: ?*anyopaque,
+    index: u32,
+    module_name: []u8,
+    import_name: []u8,
+    params: []zwasm.ir.zir.ValType,
+    results: []zwasm.ir.zir.ValType,
 };
 
 const InstanceH = struct {
     instance: zwasm.Instance,
     module: *ModuleH,
+    /// The Linker MUST outlive the instance: host/WASI CallCtx slots live in
+    /// it and the guest keeps raw pointers into them.
+    linker: ?*zwasm.Linker = null,
+    host_ctxs: std.ArrayList(*HostCtx) = .empty,
+    vfs: ?*zwasm.vfs.MemFs = null,
+    wasi_ctxs: std.ArrayList(*WasiFnCtx) = .empty,
     refs: u32 = 1,
 };
 
 const WasiEnv = struct { name: []u8, value: []u8 };
+const WasiPreopen = struct { host: []u8, guest: []u8 };
+const CfgFile = struct { path: []u8, data: []u8, writable: bool };
+const CfgDir = struct { path: []u8, writable: bool };
 
 const WasiCfgH = struct {
     args: std.ArrayList([]u8) = .empty,
     envs: std.ArrayList(WasiEnv) = .empty,
+    preopens: std.ArrayList(WasiPreopen) = .empty,
+    files: std.ArrayList(CfgFile) = .empty,
+    dirs: std.ArrayList(CfgDir) = .empty,
 };
+
+/// C ABI for a host import callback. `args`/`results` are u64 value slots
+/// (same encoding as `zw_instance_invoke`). Return 0 on success; non-zero
+/// traps the guest.
+pub const ZWHostCallback = *const fn (
+    ctx: ?*anyopaque,
+    import_index: u32,
+    args: [*]const u64,
+    n_args: u32,
+    results: [*]u64,
+    n_results: u32,
+) callconv(.c) i32;
+
+/// One host import descriptor. Mirrors the Dart FFI struct and the JS bridge
+/// object field-for-field.
+pub const ZWImportDesc = extern struct {
+    module: [*]const u8,
+    module_len: usize,
+    name: [*]const u8,
+    name_len: usize,
+    params: [*]const u8,
+    params_len: usize,
+    results: [*]const u8,
+    results_len: usize,
+};
+
+fn scalarValType(code: u8) ?zwasm.ir.zir.ValType {
+    return switch (code) {
+        0 => .i32,
+        1 => .i64,
+        2 => .f32,
+        3 => .f64,
+        else => null,
+    };
+}
+
+fn hostThunk(caller: *zwasm.Caller, args: []const zwasm.RuntimeValue, results: []zwasm.RuntimeValue) anyerror!void {
+    const hc: *HostCtx = @ptrCast(@alignCast(caller.host_data orelse return error.HostTrap));
+    if (args.len > 64 or results.len > 64) return error.HostTrap;
+    var arg_bits: [64]u64 = undefined;
+    var res_bits: [64]u64 = undefined;
+    for (args, 0..) |v, i| arg_bits[i] = v.bits64;
+    for (results) |*v| v.* = .{ .bits64 = 0 };
+    const rc = hc.cb(
+        hc.user_ctx,
+        hc.index,
+        &arg_bits,
+        @intCast(args.len),
+        &res_bits,
+        @intCast(results.len),
+    );
+    if (rc != 0) {
+        setError(ZW_ERR_TRAP, "host import {d} returned error {d}", .{ hc.index, rc });
+        return error.HostTrap;
+    }
+    for (results, 0..) |*v, i| v.* = .{ .bits64 = res_bits[i] };
+}
+
+// ── in-memory WASI filesystem host functions ───────────────────────────────
+
+const WasiFnCtx = struct {
+    fs: *zwasm.vfs.MemFs,
+    fnc: zwasm.vfs.WasiFn,
+};
+
+fn wasiThunk(caller: *zwasm.Caller, args: []const zwasm.RuntimeValue, results: []zwasm.RuntimeValue) anyerror!void {
+    const ctx: *WasiFnCtx = @ptrCast(@alignCast(caller.host_data orelse return error.HostTrap));
+    if (results.len != 1) return error.HostTrap;
+    const mem = caller.memory() orelse return error.HostTrap;
+    results[0] = .{ .i32 = @intCast(ctx.fs.dispatch(ctx.fnc, mem, args)) };
+}
+
+const I = zwasm.ir.zir.ValType;
+const R1 = [_]I{.i32};
+const P1 = [_]I{.i32};
+const P2 = [_]I{ .i32, .i32 };
+const P3 = [_]I{ .i32, .i32, .i32 };
+const P4 = [_]I{ .i32, .i32, .i32, .i32 };
+const P6 = [_]I{ .i32, .i32, .i32, .i32, .i32, .i32 };
+const SEEK = [_]I{ .i32, .i64, .i32, .i32 };
+const READDIR = [_]I{ .i32, .i32, .i32, .i64, .i32 };
+const PATH_FILESTAT = [_]I{ .i32, .i32, .i32, .i32, .i32 };
+const PATH_OPEN = [_]I{ .i32, .i32, .i32, .i32, .i32, .i64, .i64, .i32, .i32 };
+const SET_SIZE = [_]I{ .i32, .i64 };
+const SET_TIMES = [_]I{ .i32, .i64, .i64, .i32 };
+const ADVISE = [_]I{ .i32, .i64, .i64, .i32 };
+const ALLOCATE = [_]I{ .i32, .i64, .i64 };
+
+const WasiDef = struct {
+    name: []const u8,
+    fnc: zwasm.vfs.WasiFn,
+    params: []const I,
+};
+
+const wasi_defs = [_]WasiDef{
+    .{ .name = "fd_write", .fnc = .fd_write, .params = &P4 },
+    .{ .name = "fd_read", .fnc = .fd_read, .params = &P4 },
+    .{ .name = "fd_close", .fnc = .fd_close, .params = &P1 },
+    .{ .name = "fd_seek", .fnc = .fd_seek, .params = &SEEK },
+    .{ .name = "fd_tell", .fnc = .fd_tell, .params = &P2 },
+    .{ .name = "fd_fdstat_get", .fnc = .fd_fdstat_get, .params = &P2 },
+    .{ .name = "fd_filestat_get", .fnc = .fd_filestat_get, .params = &P2 },
+    .{ .name = "fd_filestat_set_size", .fnc = .fd_filestat_set_size, .params = &SET_SIZE },
+    .{ .name = "fd_filestat_set_times", .fnc = .fd_filestat_set_times, .params = &SET_TIMES },
+    .{ .name = "fd_sync", .fnc = .fd_sync, .params = &P1 },
+    .{ .name = "fd_datasync", .fnc = .fd_datasync, .params = &P1 },
+    .{ .name = "fd_advise", .fnc = .fd_advise, .params = &ADVISE },
+    .{ .name = "fd_allocate", .fnc = .fd_allocate, .params = &ALLOCATE },
+    .{ .name = "fd_fdstat_set_flags", .fnc = .fd_fdstat_set_flags, .params = &P2 },
+    .{ .name = "fd_prestat_get", .fnc = .fd_prestat_get, .params = &P2 },
+    .{ .name = "fd_prestat_dir_name", .fnc = .fd_prestat_dir_name, .params = &P3 },
+    .{ .name = "fd_readdir", .fnc = .fd_readdir, .params = &READDIR },
+    .{ .name = "path_open", .fnc = .path_open, .params = &PATH_OPEN },
+    .{ .name = "path_filestat_get", .fnc = .path_filestat_get, .params = &PATH_FILESTAT },
+    .{ .name = "path_create_directory", .fnc = .path_create_directory, .params = &P3 },
+    .{ .name = "path_remove_directory", .fnc = .path_remove_directory, .params = &P3 },
+    .{ .name = "path_unlink_file", .fnc = .path_unlink_file, .params = &P3 },
+    .{ .name = "path_rename", .fnc = .path_rename, .params = &P6 },
+};
+
+fn defineWasiFs(
+    lk: *zwasm.Linker,
+    fs: *zwasm.vfs.MemFs,
+    ctxs: *std.ArrayList(*WasiFnCtx),
+) !void {
+    for (wasi_defs) |d| {
+        const ctx = try gpa.create(WasiFnCtx);
+        ctx.* = .{ .fs = fs, .fnc = d.fnc };
+        try ctxs.append(gpa, ctx);
+        try lk.defineFuncRaw(
+            "wasi_snapshot_preview1",
+            d.name,
+            ctx,
+            d.params,
+            &R1,
+            &wasiThunk,
+        );
+    }
+}
 
 fn moduleRetain(m: *ModuleH) void {
     m.refs += 1;
@@ -181,7 +349,9 @@ fn moduleRelease(m: *ModuleH) void {
         return;
     }
     if (m.exports) |*ex| ex.deinit();
+    if (m.imports) |*im| im.deinit();
     m.module.deinit();
+    gpa.free(m.bytes);
     const eng = m.engine;
     gpa.destroy(m);
     eng.refs -= 1;
@@ -224,20 +394,32 @@ export fn zw_module_new(engine_ptr: ?*anyopaque, bytes: [*]const u8, len: usize)
         setError(ZW_ERR_INVALID_ARG, "null engine", .{});
         return null;
     }));
-    const mod = eng.engine.compile(bytes[0..len]) catch |e| {
+    // zwasm's parser stores section bodies as slices into the input buffer,
+    // so the module owns a copy for as long as it lives.
+    const owned = gpa.dupe(u8, bytes[0..len]) catch {
+        setError(ZW_ERR_INTERNAL, "out of memory", .{});
+        return null;
+    };
+    const mod = eng.engine.compile(owned) catch |e| {
+        gpa.free(owned);
         setErrorName(ZW_ERR_COMPILE, e);
         return null;
     };
     const h = gpa.create(ModuleH) catch {
+        var tmp = mod;
+        tmp.deinit();
+        gpa.free(owned);
         setError(ZW_ERR_INTERNAL, "out of memory", .{});
         return null;
     };
     h.* = .{
         .module = mod,
         .engine = eng,
+        .bytes = owned,
     };
     eng.refs += 1;
     h.exports = mod.exports(gpa) catch null;
+    h.imports = mod.imports(gpa) catch null;
     return @ptrCast(h);
 }
 
@@ -268,6 +450,41 @@ export fn zw_module_export_name(ptr: ?*anyopaque, idx: u32, buf: [*]u8, cap: usi
     const n = @min(cap, name.len);
     @memcpy(buf[0..n], name[0..n]);
     return @intCast(name.len);
+}
+
+export fn zw_module_import_count(ptr: ?*anyopaque) callconv(.c) u32 {
+    const h: *ModuleH = @ptrCast(@alignCast(ptr orelse return 0));
+    const im = h.imports orelse return 0;
+    return @intCast(im.items.len);
+}
+
+export fn zw_module_import_kind(ptr: ?*anyopaque, idx: u32) callconv(.c) u8 {
+    const h: *ModuleH = @ptrCast(@alignCast(ptr orelse return 255));
+    const im = h.imports orelse return 255;
+    if (idx >= im.items.len) return 255;
+    return externKindCode(im.items[idx].kind);
+}
+
+/// Copies the import module into `buf`; returns the full length.
+export fn zw_module_import_module(ptr: ?*anyopaque, idx: u32, buf: [*]u8, cap: usize) callconv(.c) u32 {
+    const h: *ModuleH = @ptrCast(@alignCast(ptr orelse return 0));
+    const im = h.imports orelse return 0;
+    if (idx >= im.items.len) return 0;
+    const text = im.items[idx].module;
+    const n = @min(cap, text.len);
+    @memcpy(buf[0..n], text[0..n]);
+    return @intCast(text.len);
+}
+
+/// Copies the import name into `buf`; returns the full length.
+export fn zw_module_import_name(ptr: ?*anyopaque, idx: u32, buf: [*]u8, cap: usize) callconv(.c) u32 {
+    const h: *ModuleH = @ptrCast(@alignCast(ptr orelse return 0));
+    const im = h.imports orelse return 0;
+    if (idx >= im.items.len) return 0;
+    const text = im.items[idx].name;
+    const n = @min(cap, text.len);
+    @memcpy(buf[0..n], text[0..n]);
+    return @intCast(text.len);
 }
 
 // ── function signatures ────────────────────────────────────────────────────
@@ -377,12 +594,62 @@ fn engineKind(code: u8) zwasm.api.instance.EngineKind {
     };
 }
 
+fn freeHostCtx(hc: *HostCtx) void {
+    gpa.free(hc.module_name);
+    gpa.free(hc.import_name);
+    gpa.free(hc.params);
+    gpa.free(hc.results);
+    gpa.destroy(hc);
+}
+
+fn destroyHostCtxs(list: *std.ArrayList(*HostCtx)) void {
+    for (list.items) |hc| freeHostCtx(hc);
+    list.deinit(gpa);
+}
+
+fn destroyWasiCtxs(list: *std.ArrayList(*WasiFnCtx)) void {
+    for (list.items) |ctx| gpa.destroy(ctx);
+    list.deinit(gpa);
+}
+
 export fn zw_instance_new(
     module_ptr: ?*anyopaque,
     engine_kind: u8,
     fuel: i64,
     max_memory_pages: i64,
     wasi_ptr: ?*anyopaque,
+) callconv(.c) ?*anyopaque {
+    return zw_instance_new_with_imports(
+        module_ptr,
+        engine_kind,
+        fuel,
+        max_memory_pages,
+        wasi_ptr,
+        null,
+        0,
+        null,
+        null,
+    );
+}
+
+/// Instantiate with an optional host-import table. `imports` is an array of
+/// `n_imports` descriptors; every function import is dispatched through the
+/// single `host_cb` with its index. The callback and descriptors are copied
+/// into host-owned storage, so Dart/JS may free its staging buffers on return.
+///
+/// On the web, host imports are not supported yet (the JS bridge cannot pass a
+/// wasm function pointer as `ZWHostCallback`); the call fails with
+/// ZW_ERR_INVALID_ARG instead of silently binding nothing.
+export fn zw_instance_new_with_imports(
+    module_ptr: ?*anyopaque,
+    engine_kind: u8,
+    fuel: i64,
+    max_memory_pages: i64,
+    wasi_ptr: ?*anyopaque,
+    imports: ?[*]const ZWImportDesc,
+    n_imports: u32,
+    host_ctx: ?*anyopaque,
+    host_cb: ?ZWHostCallback,
 ) callconv(.c) ?*anyopaque {
     clearError();
     const m: *ModuleH = @ptrCast(@alignCast(module_ptr orelse {
@@ -395,21 +662,182 @@ export fn zw_instance_new(
         .max_memory_pages = if (max_memory_pages < 0) .unmetered else .{ .limited = @intCast(max_memory_pages) },
     };
 
+    const has_imports = n_imports > 0;
+    const has_wasi = wasi_ptr != null;
+    if (has_imports and host_cb == null) {
+        setError(ZW_ERR_INVALID_ARG, "host callback is required for imports", .{});
+        return null;
+    }
+    if (has_imports and is_wasm) {
+        setError(ZW_ERR_INVALID_ARG, "host imports are not supported on web yet", .{});
+        return null;
+    }
+
     var inst: zwasm.Instance = undefined;
+    var linker: ?*zwasm.Linker = null;
+    var host_ctxs: std.ArrayList(*HostCtx) = .empty;
+    var vfs: ?*zwasm.vfs.MemFs = null;
+    var wasi_ctxs: std.ArrayList(*WasiFnCtx) = .empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        if (linker) |lk| {
+            lk.deinit();
+            gpa.destroy(lk);
+        }
+        destroyHostCtxs(&host_ctxs);
+        destroyWasiCtxs(&wasi_ctxs);
+        if (vfs) |fs| {
+            fs.deinit();
+            gpa.destroy(fs);
+        }
+    };
+
+    if (has_imports or has_wasi) {
+        const lk = gpa.create(zwasm.Linker) catch {
+            setError(ZW_ERR_INTERNAL, "out of memory", .{});
+            return null;
+        };
+        lk.* = zwasm.Linker.init(&m.engine.engine);
+        linker = lk;
+    }
+
     if (wasi_ptr) |wp| {
         const cfg: *WasiCfgH = @ptrCast(@alignCast(wp));
-        var lk = zwasm.Linker.init(&m.engine.engine);
-        defer lk.deinit();
-        const args = gpa.alloc([]const u8, cfg.args.items.len) catch return null;
+        const lk = linker.?;
+        const has_vfs = cfg.files.items.len > 0 or cfg.dirs.items.len > 0;
+
+        const args = gpa.alloc([]const u8, cfg.args.items.len) catch return outOfMemoryNull();
         defer gpa.free(args);
         for (cfg.args.items, 0..) |a, i| args[i] = a;
-        const envs = gpa.alloc(zwasm.WasiConfig.Env, cfg.envs.items.len) catch return null;
+
+        const envs = gpa.alloc(zwasm.WasiConfig.Env, cfg.envs.items.len) catch return outOfMemoryNull();
         defer gpa.free(envs);
         for (cfg.envs.items, 0..) |e, i| envs[i] = .{ .name = e.name, .value = e.value };
-        lk.defineWasi(.{ .args = args, .envs = envs }) catch |e| {
+
+        const preopens = gpa.alloc(zwasm.WasiConfig.Preopen, if (has_vfs) 0 else cfg.preopens.items.len) catch return outOfMemoryNull();
+        defer gpa.free(preopens);
+        if (!has_vfs) {
+            for (cfg.preopens.items, 0..) |p, i| preopens[i] = .{ .host_path = p.host, .guest_path = p.guest };
+        }
+
+        if (has_vfs) {
+            const fs = gpa.create(zwasm.vfs.MemFs) catch return outOfMemoryNull();
+            fs.* = zwasm.vfs.MemFs.init(gpa) catch {
+                gpa.destroy(fs);
+                setError(ZW_ERR_INTERNAL, "out of memory", .{});
+                return null;
+            };
+            vfs = fs;
+            for (cfg.dirs.items) |d| {
+                fs.addDir(d.path, d.writable) catch |e| {
+                    setErrorName(ZW_ERR_INSTANTIATE, e);
+                    return null;
+                };
+            }
+            for (cfg.files.items) |f| {
+                fs.addFile(f.path, f.data, f.writable) catch |e| {
+                    setErrorName(ZW_ERR_INSTANTIATE, e);
+                    return null;
+                };
+            }
+        }
+
+        var wasi_cfg: zwasm.WasiConfig = .{ .args = args, .envs = envs, .preopens = preopens };
+        if (!has_vfs and preopens.len > 0) {
+            if (comptime is_wasm) {
+                setError(ZW_ERR_INVALID_ARG, "WASI preopens are not supported on web", .{});
+                return null;
+            }
+            // Preopens only need synchronous open/close/read/write. The
+            // global single-threaded io runs those on the calling thread and
+            // has no worker pool to outlive the Dart isolate (the engine's
+            // Threaded io does, which crashes process teardown on Windows).
+            wasi_cfg.io = std.Io.Threaded.global_single_threaded.io();
+        }
+        lk.defineWasi(wasi_cfg) catch |e| {
             setErrorName(ZW_ERR_INSTANTIATE, e);
             return null;
         };
+        if (vfs) |fs| {
+            defineWasiFs(lk, fs, &wasi_ctxs) catch |e| {
+                setErrorName(ZW_ERR_INSTANTIATE, e);
+                return null;
+            };
+        }
+    }
+
+    if (has_imports) {
+        const lk = linker.?;
+        const descs = imports.?;
+        const cb = host_cb.?;
+        for (0..n_imports) |i| {
+            const d = descs[i];
+            const params = gpa.alloc(zwasm.ir.zir.ValType, d.params_len) catch return outOfMemoryNull();
+            for (0..d.params_len) |j| {
+                params[j] = scalarValType(d.params[j]) orelse {
+                    gpa.free(params);
+                    setError(ZW_ERR_INVALID_ARG, "import {d}: unsupported param type {d}", .{ i, d.params[j] });
+                    return null;
+                };
+            }
+            const results = gpa.alloc(zwasm.ir.zir.ValType, d.results_len) catch {
+                gpa.free(params);
+                return outOfMemoryNull();
+            };
+            for (0..d.results_len) |j| {
+                results[j] = scalarValType(d.results[j]) orelse {
+                    gpa.free(params);
+                    gpa.free(results);
+                    setError(ZW_ERR_INVALID_ARG, "import {d}: unsupported result type {d}", .{ i, d.results[j] });
+                    return null;
+                };
+            }
+            const hc = gpa.create(HostCtx) catch {
+                gpa.free(params);
+                gpa.free(results);
+                return outOfMemoryNull();
+            };
+            const mod_name = gpa.dupe(u8, d.module[0..d.module_len]) catch {
+                gpa.free(params);
+                gpa.free(results);
+                gpa.destroy(hc);
+                return outOfMemoryNull();
+            };
+            const imp_name = gpa.dupe(u8, d.name[0..d.name_len]) catch {
+                gpa.free(mod_name);
+                gpa.free(params);
+                gpa.free(results);
+                gpa.destroy(hc);
+                return outOfMemoryNull();
+            };
+            hc.* = .{
+                .cb = cb,
+                .user_ctx = host_ctx,
+                .index = @intCast(i),
+                .module_name = mod_name,
+                .import_name = imp_name,
+                .params = params,
+                .results = results,
+            };
+            host_ctxs.append(gpa, hc) catch {
+                freeHostCtx(hc);
+                return outOfMemoryNull();
+            };
+            lk.defineFuncRaw(
+                hc.module_name,
+                hc.import_name,
+                hc,
+                params,
+                results,
+                &hostThunk,
+            ) catch |e| {
+                setErrorName(ZW_ERR_INSTANTIATE, e);
+                return null;
+            };
+        }
+    }
+
+    if (linker) |lk| {
         inst = lk.instantiate(&m.module, opts) catch |e| {
             setErrorName(ZW_ERR_INSTANTIATE, e);
             return null;
@@ -426,14 +854,37 @@ export fn zw_instance_new(
         setError(ZW_ERR_INTERNAL, "out of memory", .{});
         return null;
     };
-    h.* = .{ .instance = inst, .module = m };
+    h.* = .{
+        .instance = inst,
+        .module = m,
+        .linker = linker,
+        .host_ctxs = host_ctxs,
+        .vfs = vfs,
+        .wasi_ctxs = wasi_ctxs,
+    };
     moduleRetain(m);
+    handed_off = true;
     return @ptrCast(h);
+}
+
+fn outOfMemoryNull() ?*anyopaque {
+    setError(ZW_ERR_INTERNAL, "out of memory", .{});
+    return null;
 }
 
 export fn zw_instance_delete(ptr: ?*anyopaque) callconv(.c) void {
     const h: *InstanceH = @ptrCast(@alignCast(ptr orelse return));
     h.instance.deinit();
+    if (h.linker) |lk| {
+        lk.deinit();
+        gpa.destroy(lk);
+    }
+    destroyHostCtxs(&h.host_ctxs);
+    destroyWasiCtxs(&h.wasi_ctxs);
+    if (h.vfs) |fs| {
+        fs.deinit();
+        gpa.destroy(fs);
+    }
     const m = h.module;
     gpa.destroy(h);
     moduleRelease(m);
@@ -516,6 +967,26 @@ export fn zw_instance_global_get(inst_ptr: ?*anyopaque, name: [*]const u8, name_
     return ZW_OK;
 }
 
+/// Export every file under an in-memory VFS mount. Returns the required
+/// length; the host calls once with `buf = null` to size, then again with a
+/// buffer. Format: u32 count, then { u32 path_len, path, u64 size, bytes }.
+export fn zw_instance_export_mount(
+    inst_ptr: ?*anyopaque,
+    root: [*]const u8,
+    root_len: usize,
+    buf: ?[*]u8,
+    cap: usize,
+) callconv(.c) u64 {
+    clearError();
+    const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return 0));
+    const fs = h.vfs orelse return 0;
+    if (buf) |b| {
+        return @intCast(fs.exportRoot(root[0..root_len], b[0..cap]));
+    }
+    var empty: [0]u8 = .{};
+    return @intCast(fs.exportRoot(root[0..root_len], empty[0..0]));
+}
+
 export fn zw_instance_global_set(inst_ptr: ?*anyopaque, name: [*]const u8, name_len: usize, bits: u64) callconv(.c) i32 {
     clearError();
     const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return arityError("null instance")));
@@ -548,6 +1019,18 @@ export fn zw_wasi_config_delete(ptr: ?*anyopaque) callconv(.c) void {
         gpa.free(e.value);
     }
     h.envs.deinit(gpa);
+    for (h.preopens.items) |p| {
+        gpa.free(p.host);
+        gpa.free(p.guest);
+    }
+    h.preopens.deinit(gpa);
+    for (h.files.items) |f| {
+        gpa.free(f.path);
+        gpa.free(f.data);
+    }
+    h.files.deinit(gpa);
+    for (h.dirs.items) |d| gpa.free(d.path);
+    h.dirs.deinit(gpa);
     gpa.destroy(h);
 }
 
@@ -578,3 +1061,70 @@ export fn zw_wasi_config_add_env(ptr: ?*anyopaque, key: [*]const u8, key_len: us
 
 /// The WASI host routes fd 0/1/2 to the embedding process by default.
 export fn zw_wasi_config_inherit_stdio(_: ?*anyopaque) callconv(.c) void {}
+
+/// Queue a host directory as a guest preopen (`/path` in the guest). The
+/// directory is opened at instantiation; preopens are unsupported on the web.
+export fn zw_wasi_config_preopen_dir(
+    ptr: ?*anyopaque,
+    host: [*]const u8,
+    host_len: usize,
+    guest: [*]const u8,
+    guest_len: usize,
+) callconv(.c) i32 {
+    const h: *WasiCfgH = @ptrCast(@alignCast(ptr orelse return ZW_ERR_INVALID_ARG));
+    if (comptime is_wasm) {
+        setError(ZW_ERR_INVALID_ARG, "WASI preopens are not supported on web", .{});
+        return ZW_ERR_INVALID_ARG;
+    }
+    const hp = gpa.dupe(u8, host[0..host_len]) catch return outOfMemory();
+    const gp = gpa.dupe(u8, guest[0..guest_len]) catch {
+        gpa.free(hp);
+        return outOfMemory();
+    };
+    h.preopens.append(gpa, .{ .host = hp, .guest = gp }) catch {
+        gpa.free(hp);
+        gpa.free(gp);
+        return outOfMemory();
+    };
+    return ZW_OK;
+}
+
+/// Add a file to the in-memory WASI VFS. The host copies both path and data.
+/// `writable` only has an effect under /data or /tmp.
+export fn zw_wasi_config_add_file(
+    ptr: ?*anyopaque,
+    path: [*]const u8,
+    path_len: usize,
+    data: [*]const u8,
+    data_len: usize,
+    writable: i32,
+) callconv(.c) i32 {
+    const h: *WasiCfgH = @ptrCast(@alignCast(ptr orelse return ZW_ERR_INVALID_ARG));
+    const p = gpa.dupe(u8, path[0..path_len]) catch return outOfMemory();
+    const d = gpa.dupe(u8, data[0..data_len]) catch {
+        gpa.free(p);
+        return outOfMemory();
+    };
+    h.files.append(gpa, .{ .path = p, .data = d, .writable = writable != 0 }) catch {
+        gpa.free(p);
+        gpa.free(d);
+        return outOfMemory();
+    };
+    return ZW_OK;
+}
+
+/// Add an explicit directory to the in-memory WASI VFS.
+export fn zw_wasi_config_add_dir(
+    ptr: ?*anyopaque,
+    path: [*]const u8,
+    path_len: usize,
+    writable: i32,
+) callconv(.c) i32 {
+    const h: *WasiCfgH = @ptrCast(@alignCast(ptr orelse return ZW_ERR_INVALID_ARG));
+    const p = gpa.dupe(u8, path[0..path_len]) catch return outOfMemory();
+    h.dirs.append(gpa, .{ .path = p, .writable = writable != 0 }) catch {
+        gpa.free(p);
+        return outOfMemory();
+    };
+    return ZW_OK;
+}

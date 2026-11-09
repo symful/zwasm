@@ -62,6 +62,12 @@ pub const Table = @import("zwasm/table.zig").Table;
 pub const Linker = @import("zwasm/linker.zig").Linker;
 pub const WasiConfig = @import("zwasm/linker.zig").WasiConfig;
 pub const Caller = @import("zwasm/caller.zig").Caller;
+/// Runtime value slot used by `Linker.defineFuncRaw` host functions.
+pub const RuntimeValue = @import("runtime/value.zig").Value;
+/// Engine-owned `std.Io` used for WASI preopens/filesystem syscalls.
+pub const engineIo = @import("api/instance.zig").engineIo;
+/// In-memory WASI filesystem used by the console.
+pub const vfs = @import("zwasm/vfs.zig");
 
 /// Zig-idiomatic tagged-union mirror of `wasm_val_t`.
 /// Wasm spec §4.2.2 — value representation at the host boundary
