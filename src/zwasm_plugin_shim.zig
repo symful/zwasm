@@ -582,10 +582,18 @@ export fn zw_instance_invoke(
         return arityError("result count does not match the export signature");
     }
 
-    const arg_vals = gpa.alloc(zwasm.Value, n_args) catch return outOfMemory();
-    defer gpa.free(arg_vals);
-    const res_vals = gpa.alloc(zwasm.Value, n_results) catch return outOfMemory();
-    defer gpa.free(res_vals);
+    var arg_stack: [16]zwasm.Value = undefined;
+    var res_stack: [8]zwasm.Value = undefined;
+    const arg_vals = if (n_args <= 16)
+        arg_stack[0..n_args]
+    else
+        gpa.alloc(zwasm.Value, n_args) catch return outOfMemory();
+    defer if (n_args > 16) gpa.free(arg_vals);
+    const res_vals = if (n_results <= 8)
+        res_stack[0..n_results]
+    else
+        gpa.alloc(zwasm.Value, n_results) catch return outOfMemory();
+    defer if (n_results > 8) gpa.free(res_vals);
     for (arg_vals, 0..) |*slot, i| slot.* = decodeValue(sig.params[i], args[i]);
     for (res_vals) |*slot| slot.* = .{ .i32 = 0 };
 
