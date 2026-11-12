@@ -105,6 +105,7 @@ pub const Dir = struct {
 pub const Mount = struct {
     root: []const u8,
     writable: bool,
+    quota: usize = std.math.maxInt(usize),
     files: std.ArrayList(*File) = .empty,
     dirs: std.ArrayList(*Dir) = .empty,
 };
@@ -132,6 +133,19 @@ pub const MemFs = struct {
     pub fn setWriteCallback(self: *MemFs, ctx: ?*anyopaque, cb: ?WriteCallback) void {
         self.write_ctx = ctx;
         self.write_cb = cb;
+    }
+
+    /// Bound the total file payload under `root`. Returns false if missing.
+    pub fn setMountQuota(self: *MemFs, root: []const u8, quota: usize) bool {
+        const mi = self.mountFor(root) orelse return false;
+        self.mounts.items[mi].quota = quota;
+        return true;
+    }
+
+    fn mountUsed(self: *MemFs, mi: usize) usize {
+        var used: usize = 0;
+        for (self.mounts.items[mi].files.items) |f| used += f.data.len;
+        return used;
     }
 
     pub fn init(alloc: Allocator) !MemFs {
@@ -468,6 +482,9 @@ pub const MemFs = struct {
                 const end = slot.offset + l;
                 if (end > f.data.len) {
                     const old_len = f.data.len;
+                    const mount = &self.mounts.items[slot.mount];
+                    const used = self.mountUsed(slot.mount);
+                    if (used - old_len + end > mount.quota) return e(.nospc);
                     f.data = self.alloc.realloc(f.data, @intCast(end)) catch return e(.nomem);
                     @memset(f.data[old_len..@intCast(end)], 0);
                 }
@@ -603,6 +620,11 @@ pub const MemFs = struct {
         if (size < 0) return e(.inval);
         const f = self.findFile(slot.mount, slot.path) orelse return e(.noent);
         const old = f.data.len;
+        if (@as(usize, @intCast(size)) > old) {
+            const mount = &self.mounts.items[slot.mount];
+            const used = self.mountUsed(slot.mount);
+            if (used - old + @as(usize, @intCast(size)) > mount.quota) return e(.nospc);
+        }
         f.data = self.alloc.realloc(f.data, @intCast(size)) catch return e(.nomem);
         if (@as(usize, @intCast(size)) > old) @memset(f.data[old..], 0);
         return e(.success);

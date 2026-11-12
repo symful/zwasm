@@ -1085,6 +1085,26 @@ export fn zw_instance_import_mount(
     return ZW_OK;
 }
 
+/// Bound the file payload of one VFS mount. Returns ZW_OK or invalid arg.
+export fn zw_instance_set_mount_quota(
+    inst_ptr: ?*anyopaque,
+    root: [*]const u8,
+    root_len: usize,
+    quota: u64,
+) callconv(.c) i32 {
+    clearError();
+    const h: *InstanceH = @ptrCast(@alignCast(inst_ptr orelse return ZW_ERR_INVALID_ARG));
+    const fs = h.vfs orelse {
+        setError(ZW_ERR_INVALID_ARG, "instance has no VFS", .{});
+        return ZW_ERR_INVALID_ARG;
+    };
+    if (!fs.setMountQuota(root[0..root_len], @intCast(quota))) {
+        setError(ZW_ERR_INVALID_ARG, "unknown mount", .{});
+        return ZW_ERR_INVALID_ARG;
+    }
+    return ZW_OK;
+}
+
 /// Install a write-through callback for VFS file writes. Pass null to clear.
 export fn zw_instance_set_vfs_write_callback(
     inst_ptr: ?*anyopaque,
